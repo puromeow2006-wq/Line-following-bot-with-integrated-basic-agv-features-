@@ -1,0 +1,378 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// --- WIFI CREDENTIALS ---
+const char* ssid     = "Adikane-Home";
+const char* password = "Bsnl@4321";
+
+// --- STATIC IP CONFIGURATION ---
+IPAddress local_IP(192, 168, 1, 100);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+// --- PIN DEFINITIONS ---
+// Motor Pins (L298N)
+const int ENA = 13; const int IN1 = 12; const int IN2 = 14;
+const int IN3 = 27; const int IN4 = 26; const int ENB = 25;
+
+// Sensor Pins (Digital IR & Ultrasonic)
+const int irL = 34; const int irM = 35; const int irR = 32;
+const int trigPin = 23; const int echoPin = 22;
+
+// --- ROBOT SPEEDS ---
+int speed = 60;
+
+// --- STATE MACHINE VARIABLES ---
+String statusMsg = "Ready at Point A";
+enum State { IDLE, TO_B, AT_B, TO_C, FINISHED, OBJECT_DETECTED };
+State currentState = IDLE;
+State previousState = IDLE;
+unsigned long waitTime = 0;
+unsigned long obstacleCheckTime = 0;
+unsigned long obstacleStopTime = 0;
+unsigned long objectClearStartTime = 0;
+
+// --- CHECKPOINT DETECTION VARIABLES ---
+unsigned long checkpointDetectedTime = 0;
+bool checkpointConfirmed = false;
+
+// --- OBJECT DETECTION VARIABLES ---
+bool objectInPath = false;
+unsigned long lastUltrasonicRead = 0;
+float lastDistance = 999;
+int consecutiveClearReadings = 0;
+
+WebServer server(80);
+
+// =========================================================
+// 1. THE CORE MOVEMENT LOGIC (Pivot Steering)
+// =========================================================
+void moveRobot(String motion) {
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+
+  if (motion == "Forward") {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  }
+  else if (motion == "Left") {
+    digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  }
+  else if (motion == "Right") {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);
+  }
+  else if (motion == "Stop") {
+    digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+    analogWrite(ENA, 0);    analogWrite(ENB, 0);
+  }
+}
+
+void stopBot() { 
+  moveRobot("Stop"); 
+}
+
+// =========================================================
+// 2. ULTRASONIC SENSOR WITH TIMEOUT (NON-BLOCKING)
+// =========================================================
+float getDistance() {
+  digitalWrite(trigPin, LOW); 
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH); 
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  // Timeout after 30ms to prevent blocking
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  
+  if (duration == 0) {
+    return 999;
+  }
+  return duration * 0.034 / 2;
+}
+
+// Non-blocking obstacle check - call frequently but reads sensor only every 100ms
+void checkObstacle() {
+  // Read ultrasonic only every 100ms to avoid slowing down line following
+  if (millis() - lastUltrasonicRead < 100) {
+    return;
+  }
+  lastUltrasonicRead = millis();
+  
+  float distance = getDistance();
+  lastDistance = distance;
+  
+  // Object detected within 15cm
+  if (distance < 15 && distance > 2) {
+    consecutiveClearReadings = 0; // Reset clear counter
+    if (!objectInPath && currentState != OBJECT_DETECTED && currentState != IDLE && currentState != FINISHED) {
+      objectInPath = true;
+      previousState = currentState;
+      currentState = OBJECT_DETECTED;
+      obstacleStopTime = millis();
+      stopBot();
+      statusMsg = "Object detected - waiting for clearance";
+      Serial.println("Object detected at " + String(distance) + " cm - Robot stopped");
+    }
+  } 
+  else {
+    // No object detected
+    if (objectInPath) {
+      // Require 3 consecutive clear readings (300ms) before resuming
+      consecutiveClearReadings++;
+      Serial.println("Clear reading " + String(consecutiveClearReadings) + "/3");
+      
+      if (consecutiveClearReadings >= 3) {
+        // Object is truly gone
+        objectInPath = false;
+        consecutiveClearReadings = 0;
+        Serial.println("Object cleared - Resuming operation");
+        
+        // Resume previous state
+        if (previousState == TO_B) {
+          currentState = TO_B;
+          statusMsg = "Moving from A to B";
+          Serial.println("Resuming journey from A to B");
+        }
+        else if (previousState == TO_C) {
+          currentState = TO_C;
+          statusMsg = "Moving from B to final destination";
+          Serial.println("Resuming journey from B to final destination");
+        }
+        else if (previousState == AT_B) {
+          currentState = AT_B;
+          // Adjust remaining wait time at Point B
+          unsigned long elapsedBeforeStop = obstacleStopTime - waitTime;
+          unsigned long remainingWait = 5000 - elapsedBeforeStop;
+          waitTime = millis() - (5000 - remainingWait);
+          statusMsg = "HALT 5sec at B";
+          Serial.println("Resuming halt at Point B");
+        }
+      }
+    } else {
+      consecutiveClearReadings = 0;
+    }
+  }
+}
+
+// =========================================================
+// 3. LINE FOLLOWING LOGIC (Using all 3 sensors)
+// =========================================================
+void lineFollow(int Left, int Center, int Right) {
+  if (Center == HIGH && Left == LOW && Right == LOW) {
+    moveRobot("Forward");
+  }
+  else if (Left == HIGH && Center == LOW) {
+    moveRobot("Left");
+  }
+  else if (Right == HIGH && Center == LOW) {
+    moveRobot("Right");
+  }
+  else if (Left == HIGH && Center == HIGH) {
+    moveRobot("Left");
+  }
+  else if (Right == HIGH && Center == HIGH) {
+    moveRobot("Right");
+  }
+  else if (Left == LOW && Right == LOW && Center == LOW) {
+    moveRobot("Forward");
+  }
+  else if (Left == HIGH && Center == HIGH && Right == HIGH) {
+    moveRobot("Stop");
+  }
+}
+
+// =========================================================
+// 4. WEB SERVER UI
+// =========================================================
+void handleRoot() {
+  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='1'>";
+  html += "<style>body{font-family:sans-serif;text-align:center;background:#f0f0f0;}";
+  html += ".card{background:white;padding:20px;border-radius:15px;display:inline-block;";
+  html += "box-shadow:0 4px 6px rgba(0,0,0,0.1);margin-top:50px;}";
+  html += "button{padding:15px 30px;font-size:18px;border-radius:10px;cursor:pointer;margin:10px;border:none;}";
+  html += ".status{color:#007bff;font-weight:bold;}";
+  html += ".obstacle{color:#dc3545;font-weight:bold;}";
+  html += "</style></head><body>";
+  html += "<div class='card'><h1>Robot Control Panel</h1>";
+  
+  if (currentState == OBJECT_DETECTED) {
+    html += "<h2 class='obstacle'>" + statusMsg + "</h2>";
+  } else {
+    html += "<h2 class='status'>" + statusMsg + "</h2>";
+  }
+  
+  if (lastDistance < 15 && lastDistance > 2) {
+    html += "<p class='obstacle'>Object at " + String(lastDistance) + " cm</p>";
+  }
+
+  if (currentState == IDLE) {
+    html += "<a href='/start'><button style='background:#28a745;color:white;'>START JOURNEY</button></a>";
+  }
+  if (currentState == FINISHED) {
+    html += "<a href='/reset'><button style='background:#6c757d;color:white;'>RESET TO POINT A</button></a>";
+  }
+  if (currentState == OBJECT_DETECTED) {
+    html += "<p style='color:#dc3545;'>Waiting for object to be removed...</p>";
+  }
+
+  html += "</div></body></html>";
+  server.send(200, "text/html", html);
+}
+
+// =========================================================
+// 5. SETUP
+// =========================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(irL, INPUT);
+  pinMode(irM, INPUT);
+  pinMode(irR, INPUT);
+
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  if (!WiFi.config(local_IP, gateway, subnet)) {
+    Serial.println("STA Failed");
+  }
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi Connected");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", handleRoot);
+  server.on("/start", []() {
+    currentState = TO_B;
+    checkpointDetectedTime = 0;
+    checkpointConfirmed = false;
+    objectInPath = false;
+    consecutiveClearReadings = 0;
+    statusMsg = "Moving from A to B";
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+  server.on("/reset", []() {
+    currentState = IDLE;
+    statusMsg = "Ready at Point A";
+    checkpointDetectedTime = 0;
+    checkpointConfirmed = false;
+    objectInPath = false;
+    consecutiveClearReadings = 0;
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+  server.begin();
+  
+  Serial.println("Robot Ready");
+  Serial.println("Object detection active - Robot will stop for obstacles within 15cm");
+  Serial.println("Requires 3 consecutive clear readings (0.3 seconds) to resume");
+}
+
+// =========================================================
+// 6. MAIN LOOP & STATE MACHINE
+// =========================================================
+void loop() {
+  server.handleClient();
+  
+  // Check for obstacles only when robot is moving or in object detected state
+  if (currentState == TO_B || currentState == TO_C || currentState == AT_B || currentState == OBJECT_DETECTED) {
+    checkObstacle();
+  }
+  
+  // If object detected, don't process movement
+  if (currentState == OBJECT_DETECTED) {
+    // Just wait and keep checking obstacle
+    delay(50);
+    return;
+  }
+
+  // Read IR sensors
+  int L = digitalRead(irL);
+  int M = digitalRead(irM);
+  int R = digitalRead(irR);
+
+  switch (currentState) {
+
+    case TO_B:
+      statusMsg = "Moving from A to B";
+      
+      if (L == HIGH && M == HIGH && R == HIGH) {
+        if (!checkpointConfirmed) {
+          if (checkpointDetectedTime == 0) {
+            checkpointDetectedTime = millis();
+            Serial.println("Checkpoint detected - verifying");
+          }
+          else if (millis() - checkpointDetectedTime > 100) {
+            checkpointConfirmed = true;
+            Serial.println("Checkpoint confirmed - Reached Point B");
+          }
+        }
+        
+        if (checkpointConfirmed) {
+          stopBot();
+          currentState = AT_B;
+          waitTime = millis();
+          statusMsg = "HALT 5sec at B";
+          checkpointDetectedTime = 0;
+          checkpointConfirmed = false;
+        } else {
+          lineFollow(L, M, R);
+        }
+      } else {
+        if (checkpointDetectedTime != 0) {
+          Serial.println("False checkpoint - continuing");
+        }
+        checkpointDetectedTime = 0;
+        checkpointConfirmed = false;
+        lineFollow(L, M, R);
+      }
+      break;
+
+    case AT_B:
+      if (millis() - waitTime > 5000) {
+        Serial.println("Leaving Point B - Moving to final destination");
+        moveRobot("Forward");
+        delay(400);
+        stopBot();
+        delay(100);
+        currentState = TO_C;
+        statusMsg = "Moving from B to final destination";
+      }
+      break;
+
+    case TO_C:
+      statusMsg = "Moving from B to final destination";
+      
+      if (L == LOW && M == LOW && R == LOW) {
+        stopBot();
+        currentState = FINISHED;
+        statusMsg = "Reached the destination";
+        Serial.println("Destination reached");
+      } else {
+        lineFollow(L, M, R);
+      }
+      break;
+
+    case IDLE:
+      stopBot();
+      break;
+      
+    case FINISHED:
+      stopBot();
+      break;
+  }
+}
